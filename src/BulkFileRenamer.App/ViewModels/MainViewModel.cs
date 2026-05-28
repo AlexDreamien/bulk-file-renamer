@@ -93,30 +93,60 @@ public partial class MainViewModel : ObservableObject
     {
         var items = Files.Select(f => new FileItem(f.OldFullPath)).ToList();
         var ops = RenamePlanner.Plan(items, BuildPipeline());
+
+        IReadOnlyList<ExecutedRename>? executed = null;
+        string? errorMessage = null;
+
         try
         {
-            _lastBatch = _executor.Execute(ops);
+            executed = _executor.Execute(ops);
+        }
+        catch (RenameExecutionException ex)
+        {
+            executed = ex.Executed;
+            errorMessage = ex.Message;
         }
         catch (IOException ex)
         {
+            // Execute threw before any move — no partial work to save.
             StatusMessage = "Error: " + ex.Message;
             return;
         }
-        // Replace items with their post-rename paths
-        var renamed = new List<FileRowViewModel>();
+
+        // Build a lookup: old path -> new path for files that were actually moved.
+        var movedPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in executed)
+            movedPaths[e.OldPath] = e.NewPath;
+
+        // Update Files to reflect the paths that actually changed.
+        var updatedRows = new List<FileRowViewModel>(ops.Count);
         foreach (var op in ops)
         {
-            renamed.Add(new FileRowViewModel
+            var currentPath = movedPaths.TryGetValue(op.Source.FullPath, out var np)
+                ? np
+                : op.Source.FullPath;
+            updatedRows.Add(new FileRowViewModel
             {
-                OldFullPath = op.NewFullPath,
-                OldName = Path.GetFileName(op.NewFullPath),
-                NewName = Path.GetFileName(op.NewFullPath),
+                OldFullPath = currentPath,
+                OldName = Path.GetFileName(currentPath),
+                NewName = Path.GetFileName(currentPath),
             });
         }
         Files.Clear();
-        foreach (var row in renamed) Files.Add(row);
-        CanUndo = _lastBatch.Count > 0;
-        StatusMessage = $"Renamed {_lastBatch.Count} file(s).";
+        foreach (var row in updatedRows) Files.Add(row);
+
+        _lastBatch = executed;
+        CanUndo = executed.Count > 0;
+
+        if (errorMessage is not null)
+        {
+            StatusMessage = $"Partial rename ({executed.Count} file(s) moved). Error: {errorMessage}";
+        }
+        else
+        {
+            StatusMessage = $"Renamed {executed.Count} file(s).";
+        }
+
         UpdatePreview();
     }
 

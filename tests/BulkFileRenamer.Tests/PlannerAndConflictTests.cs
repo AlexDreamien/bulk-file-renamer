@@ -189,4 +189,163 @@ public class RenameExecutorIntegrationTests
             Directory.Delete(tmp, recursive: true);
         }
     }
+
+    [Fact]
+    public void Case_only_rename_changes_casing_on_real_filesystem()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "bfr_test_" + Path.GetRandomFileName());
+        Directory.CreateDirectory(tmp);
+        try
+        {
+            var original = Path.Combine(tmp, "Report.txt");
+            File.WriteAllText(original, "hello");
+
+            var items = new[] { new FileItem(original) };
+            var pipeline = new RenamePipeline();
+            pipeline.Rules.Add(new ChangeCaseRule { Mode = CaseMode.Lower });
+            var ops = RenamePlanner.Plan(items, pipeline);
+
+            var executor = new RenameExecutor();
+            var executed = executor.Execute(ops);
+
+            // After rename, actual on-disk name must be lower-case.
+            var files = Directory.GetFiles(tmp);
+            Assert.Single(files);
+            Assert.Equal("report.txt", Path.GetFileName(files[0]),
+                StringComparer.Ordinal);
+
+            // Undo must restore original casing.
+            executor.Undo(executed);
+            files = Directory.GetFiles(tmp);
+            Assert.Single(files);
+            Assert.Equal("Report.txt", Path.GetFileName(files[0]),
+                StringComparer.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(tmp, recursive: true);
+        }
+    }
+}
+
+public class PartialFailureTests
+{
+    private sealed class FaultingMover : IFileMover
+    {
+        private readonly int _failOnIndex;
+        private int _callCount;
+        public List<(string From, string To)> Moves { get; } = new();
+
+        public FaultingMover(int failOnIndex) => _failOnIndex = failOnIndex;
+
+        public void Reset()
+        {
+            _callCount = int.MinValue; // will never match _failOnIndex again
+            Moves.Clear();
+        }
+
+        public void Move(string from, string to)
+        {
+            if (_callCount == _failOnIndex)
+                throw new IOException("Simulated failure");
+            _callCount++;
+            Moves.Add((from, to));
+        }
+    }
+
+    [Fact]
+    public void Execute_throws_RenameExecutionException_with_completed_moves()
+    {
+        // Mover fails on the 2nd call (index 1), so op[0] succeeds, op[1] fails.
+        var mover = new FaultingMover(failOnIndex: 1);
+        var executor = new RenameExecutor(mover);
+        var ops = new List<RenameOperation>
+        {
+            new(new FileItem(Path.Combine("C:", "a.txt")), Path.Combine("C:", "1.txt")),
+            new(new FileItem(Path.Combine("C:", "b.txt")), Path.Combine("C:", "2.txt")),
+            new(new FileItem(Path.Combine("C:", "c.txt")), Path.Combine("C:", "3.txt")),
+        };
+
+        var ex = Assert.Throws<RenameExecutionException>(() => executor.Execute(ops));
+
+        Assert.Single(ex.Executed);
+        Assert.Equal(Path.Combine("C:", "a.txt"), ex.Executed[0].OldPath);
+        Assert.Equal(Path.Combine("C:", "1.txt"), ex.Executed[0].NewPath);
+        Assert.IsType<IOException>(ex.InnerException);
+    }
+
+    [Fact]
+    public void Undo_after_partial_failure_reverses_completed_moves()
+    {
+        var mover = new FaultingMover(failOnIndex: 1);
+        var executor = new RenameExecutor(mover);
+        var ops = new List<RenameOperation>
+        {
+            new(new FileItem(Path.Combine("C:", "a.txt")), Path.Combine("C:", "1.txt")),
+            new(new FileItem(Path.Combine("C:", "b.txt")), Path.Combine("C:", "2.txt")),
+        };
+
+        var ex = Assert.Throws<RenameExecutionException>(() => executor.Execute(ops));
+
+        // Pretend caller saved the partial batch; now undo it.
+        // Reset the mover so it no longer faults on subsequent calls.
+        mover.Reset();
+        executor.Undo(ex.Executed);
+
+        Assert.Single(mover.Moves);
+        Assert.Equal((Path.Combine("C:", "1.txt"), Path.Combine("C:", "a.txt")), mover.Moves[0]);
+    }
+}
+
+public class PathTraversalConflictTests
+{
+    [Fact]
+    public void Path_traversal_via_prefix_is_flagged_as_conflict()
+    {
+        // Simulate PrefixRule producing "..\..\Windows\Report" for a file in C:\tmp\
+        var sourceDir = Path.Combine("C:", "tmp");
+        var source = Path.Combine(sourceDir, "report.txt");
+        // The new path escapes the directory — e.g. attacker prefix "..\..\Windows\"
+        var traversalTarget = Path.GetFullPath(Path.Combine(sourceDir, @"..\..\Windows\report.txt"));
+        var ops = new List<RenameOperation>
+        {
+            new(new FileItem(source), traversalTarget),
+        };
+
+        var conflicts = ConflictDetector.Find(ops);
+
+        Assert.Single(conflicts);
+        Assert.Equal(0, conflicts[0].IndexA);
+        Assert.Equal(0, conflicts[0].IndexB);
+    }
+
+    [Fact]
+    public void Normal_same_directory_rename_is_not_flagged()
+    {
+        var source = Path.Combine("C:", "tmp", "report.txt");
+        var dest = Path.Combine("C:", "tmp", "REPORT.txt");
+        var ops = new List<RenameOperation>
+        {
+            new(new FileItem(source), dest),
+        };
+
+        Assert.Empty(ConflictDetector.Find(ops));
+    }
+
+    [Fact]
+    public void Apply_blocked_when_path_traversal_conflict_present()
+    {
+        // ConflictDetector.Find returns non-empty → HasConflicts = true → CanApply = false.
+        // Verify at the Core level: RenamePlanner + ConflictDetector together.
+        var sourceDir = Path.Combine("C:", "tmp");
+        var source = Path.Combine(sourceDir, "report.txt");
+        var traversalTarget = Path.GetFullPath(Path.Combine(sourceDir, @"..\..\Windows\report.txt"));
+        var ops = new List<RenameOperation>
+        {
+            new(new FileItem(source), traversalTarget),
+        };
+
+        var conflicts = ConflictDetector.Find(ops);
+        Assert.NotEmpty(conflicts);
+    }
 }
